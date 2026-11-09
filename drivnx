@@ -308,6 +308,8 @@ def install_notifier(quiet: bool = False) -> bool:
         conf["workspaces"] = [w for w in conf["workspaces"] if Path(os.path.expanduser(w)).resolve() != WS] + [str(WS)]
     if not conf.get("name"):
         conf["name"] = run(["git", "config", "--global", "user.name"]).stdout.strip()
+    if not conf.get("name") and interactive():
+        conf["name"] = input("  ? Your name in team posts (e.g. Tam): ").strip()
     if json.dumps(conf, sort_keys=True) != before_conf:
         CONFIG.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         changed = True
