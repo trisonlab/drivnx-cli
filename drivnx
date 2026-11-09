@@ -319,10 +319,14 @@ def install_notifier(quiet: bool = False) -> bool:
     return changed
 
 
+def is_report_job(line: str) -> bool:
+    return "pumble-notify.py" in line and "digest" in line
+
+
 def schedule_installed() -> bool:
     if WINDOWS:
         return run(["schtasks", "/Query", "/TN", TASK]).returncode == 0
-    return which("crontab") is not None and "pumble-notify.py digest" in run(["crontab", "-l"]).stdout
+    return which("crontab") is not None and any(is_report_job(l) for l in run(["crontab", "-l"]).stdout.splitlines())
 
 
 def install_schedule() -> None:
@@ -337,7 +341,7 @@ def install_schedule() -> None:
         warn("crontab not found: the report will post the next time you use Claude Code instead")
         return
     current = run(["crontab", "-l"]).stdout.splitlines()
-    lines = [l for l in current if "pumble-notify.py digest" not in l]
+    lines = [l for l in current if not is_report_job(l)]
     lines.append(f'5 * * * * "{py}" "{NOTIFIER}" digest --due >/dev/null 2>&1')
     r = run(["crontab", "-"], input="\n".join(lines) + "\n")
     ok("crontab: hourly at :05") if r.returncode == 0 else fail(f"crontab failed: {r.stderr.strip()}")

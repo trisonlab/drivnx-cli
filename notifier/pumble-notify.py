@@ -61,6 +61,11 @@ DEFAULTS = {
     "channels": {"activity": "dev-activity", "daily": "daily-report"},
     "workspaces": [],
 }
+for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252, which has no emoji
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
 DRY_RUN = bool(os.environ.get("PUMBLE_NOTIFY_DRY_RUN")) or "--dry-run" in sys.argv
 
 
