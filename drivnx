@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""drivnx: set up and look after the DrivnX workspace. See README.md.
+
+    drivnx install [--skip-deps] [--skip-mcp] [--no-schedule]   set up everything (safe to re-run)
+    drivnx status [--online]                                      health check
+    drivnx update                                                 pull every repo (fast-forward only), refresh setup
+    drivnx report [YYYY-MM-DD] [--post]                           preview (or post) a daily report
+    drivnx skills sync                                            apply drivnx-docs/ai-skills/baseline.txt everywhere
+
+The workspace is the folder that holds this repo (drivnx-cli) next to drivnx-docs, drivnx-web and drivnx-landing.
+Linux, macOS and Windows; Python 3.10+; standard library only.
+"""
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+if sys.version_info < (3, 10):
+    sys.exit("drivnx needs Python 3.10 or newer")
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    except AttributeError:
+        pass
+
+ORG = "trisonlab"
+REPOS = ["drivnx-docs", "drivnx-web", "drivnx-landing"]
+DEPS = {  # from each repo's README / CONTRIBUTING
+    "drivnx-web": [["uv", "sync", "--frozen"], ["pnpm", "--dir", "apps/web", "install", "--frozen-lockfile"]],
+    "drivnx-landing": [["npm", "ci"]],
+}
+PLANE_URL = "https://mcp.plane.so/http/mcp"
+PUMBLE_URL = "https://mcp.pumble.com/mcp"
+WINDOWS = os.name == "nt"
+MAC = sys.platform == "darwin"
+HOME = Path.home()
+CLI = Path(__file__).resolve().parent
+WS = CLI.parent
+NOTIFIER_SRC = CLI / "notifier" / "pumble-notify.py"
+NOTIFIER = HOME / ".claude" / "hooks" / "pumble-notify.py"
+SETTINGS = HOME / ".claude" / "settings.json"
+CLAUDE_JSON = HOME / ".claude.json"
+CONFIG = HOME / ".config" / "drivnx" / "pumble.json"
+BIN_DIR = HOME / ".local" / "bin"
+TASK = "DrivnX daily report"
+
+# Tools: (why, official one-line installer or None, how to install by hand)
+TOOLS = {
+    "git": ("required", None, "https://git-scm.com/downloads"),
+    "claude": ("required", ("powershell -c \"irm https://claude.ai/install.ps1 | iex\"" if WINDOWS
+                            else "curl -fsSL https://claude.ai/install.sh | bash"), "https://claude.com/claude-code"),
+    "gh": ("recommended", None, "winget install GitHub.cli" if WINDOWS else
+           "brew install gh" if MAC else "https://github.com/cli/cli/blob/trunk/docs/install_linux.md"),
+    "uv": ("drivnx-web", ("powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\""
+                          if WINDOWS else "curl -LsSf https://astral.sh/uv/install.sh | sh"), "https://docs.astral.sh/uv/"),
+    "npm": ("drivnx-landing", None, "winget install OpenJS.NodeJS.LTS" if WINDOWS else
+            "brew install node" if MAC else "https://nodejs.org/en/download (Node 22)"),
+    "pnpm": ("drivnx-web", ("powershell -c \"iwr https://get.pnpm.io/install.ps1 -useb | iex\"" if WINDOWS
+                            else "curl -fsSL https://get.pnpm.io/install.sh | sh -"), "https://pnpm.io/installation"),
+}
+EXTRA_PATHS = [HOME / ".local" / "bin", HOME / ".cargo" / "bin", HOME / ".local" / "share" / "pnpm",
+               HOME / "Library" / "pnpm", Path(os.environ.get("LOCALAPPDATA", HOME)) / "pnpm"]
+
+
+# ---------------------------------------------------------------- helpers
+
+def ok(msg: str) -> None:
+    print(f"  ✔ {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"  ! {msg}")
+
+
+def fail(msg: str) -> None:
+    print(f"  ✘ {msg}")
+
+
+def step(title: str) -> None:
+    print(f"\n{title}")
+
+
+def interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def ask(question: str) -> bool:
+    if not interactive():
+        return False
+    return input(f"  ? {question} [Y/n] ").strip().lower() in ("", "y", "yes")
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def run(cmd: list[str], cwd: Path | None = None, live: bool = False, input: str | None = None) -> subprocess.CompletedProcess:
+    exe = which(cmd[0]) or cmd[0]  # resolves npm.cmd, claude.cmd, ... on Windows
+    if live:
+        return subprocess.run([exe, *cmd[1:]], cwd=cwd)
+    return subprocess.run([exe, *cmd[1:]], cwd=cwd, capture_output=True, text=True, input=input)
+
+
+def git(repo: Path, *args: str) -> str:
+    r = run(["git", "-C", str(repo), *args])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def python_exe() -> str:
+    """The interpreter hooks and the scheduled job should use (not a venv that may disappear)."""
+    exe = getattr(sys, "_base_executable", None) or sys.executable
+    if WINDOWS:  # pythonw runs the scheduled job without flashing a console window
+        w = Path(exe).with_name("pythonw.exe")
+        return str(w) if w.exists() else exe
+    return exe
+
+
+def file_hash(p: Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
+
+
+def mcp_servers() -> dict:
+    try:
+        return json.loads(CLAUDE_JSON.read_text(encoding="utf-8")).get("mcpServers", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def gh_logged_in() -> bool:
+    return bool(which("gh")) and run(["gh", "auth", "status"]).returncode == 0
+
+
+def tool_version(name: str) -> str:
+    if not which(name):
+        return ""
+    r = run([name, "--version"])
+    out = (r.stdout or r.stderr).strip().splitlines()
+    return out[0] if out else "installed"
+
+
+def manifest_requirements(repo: Path) -> list[str]:
+    """Paths under `requirements:` in a repo's .ai/manifest.yaml (the layout depends on them)."""
+    m = repo / ".ai" / "manifest.yaml"
+    if not m.is_file():
+        return []
+    paths, inside = [], False
+    for line in m.read_text(encoding="utf-8").splitlines():
+        if line.startswith("requirements:"):
+            inside = True
+        elif inside and line.startswith("  - "):
+            paths.append(line[4:].strip().strip("'\""))
+        elif inside and line and not line.startswith(" "):
+            break
+    return paths
+
+
+# ---------------------------------------------------------------- install steps
+
+def check_tools(skip_deps: bool) -> bool:
+    """Offer the official installers for missing tools. Returns False if a required tool is still missing."""
+    step("1. Tools")
+    for name, (why, installer, manual) in TOOLS.items():
+        if skip_deps and why in ("drivnx-web", "drivnx-landing"):
+            continue
+        if which(name):
+            ok(f"{name:<7} {tool_version(name)}")
+            continue
+        if installer and ask(f"{name} is missing ({why}). Install it now with its official installer?"):
+            subprocess.run(installer, shell=True)
+            os.environ["PATH"] = os.pathsep.join([os.environ.get("PATH", ""), *map(str, EXTRA_PATHS)])
+        if which(name):
+            ok(f"{name:<7} installed")
+        else:
+            (fail if why == "required" else warn)(
+                f"{name:<7} missing ({why}). Install: {installer or manual}, then open a new terminal and re-run")
+    if which("gh") and not gh_logged_in() and ask("Log in to GitHub now (needed to push and open PRs)?"):
+        run(["gh", "auth", "login", "--web", "--git-protocol", "https"], live=True)
+    if which("gh"):
+        (ok if gh_logged_in() else warn)("GitHub   " + ("logged in" if gh_logged_in() else "not logged in: run gh auth login"))
+    return all(which(n) for n, (why, *_) in TOOLS.items() if why == "required" and n != "claude")
+
+
+def clone_repos() -> None:
+    step("2. Repos")
+    use_gh = gh_logged_in()
+    for name in REPOS:
+        path = WS / name
+        if (path / ".git").exists():
+            ok(f"{name}: present")
+        elif path.exists():
+            fail(f"{name}: {path} exists but is not a git repo; move it away and re-run")
+        else:
+            cmd = (["gh", "repo", "clone", f"{ORG}/{name}", str(path)] if use_gh
+                   else ["git", "clone", f"https://github.com/{ORG}/{name}.git", str(path)])
+            print(f"  … cloning {ORG}/{name}")
+            if run(cmd, live=True).returncode == 0:
+                ok(f"{name}: cloned")
+            else:
+                fail(f"{name}: clone failed (check your GitHub access to {ORG})")
+
+
+def install_deps() -> None:
+    step("3. Dependencies (from the lockfiles)")
+    for name, cmds in DEPS.items():
+        repo = WS / name
+        if not repo.is_dir():
+            warn(f"{name}: not cloned, skipped")
+            continue
+        for cmd in cmds:
+            line = " ".join(cmd)
+            if not which(cmd[0]):
+                warn(f"{name}: `{cmd[0]}` not found. Install it, then run `drivnx install` again")
+                continue
+            print(f"  … {name}: {line}")
+            if run(cmd, cwd=repo, live=True).returncode == 0:
+                ok(f"{name}: {line}")
+            else:
+                fail(f"{name}: `{line}` failed (see the output above)")
+
+
+def setup_mcp() -> bool:
+    """Returns True if Plane was just added (the user still has to sign in)."""
+    step("4. Claude Code: Plane and Pumble")
+    if not which("claude"):
+        warn("Claude Code not found: install it, then run `drivnx install` again")
+        return False
+    servers, plane_added = mcp_servers(), False
+    if "plane" in servers:
+        ok("plane: configured")
+    elif run(["claude", "mcp", "add", "--scope", "user", "--transport", "http", "plane", PLANE_URL]).returncode == 0:
+        ok("plane: added")
+        plane_added = True
+    else:
+        fail("plane: `claude mcp add` failed")
+
+    if "pumble" in servers:
+        ok("pumble: configured")
+    elif not interactive():
+        warn("pumble: skipped (needs keys; run `drivnx install` in a terminal)")
+    else:
+        print("  Pumble needs the Claude app's App key and bot token (the owner sends them; input is hidden).")
+        app_key = getpass.getpass("  App key (xpat-…, Enter to skip): ").strip()
+        token = getpass.getpass("  Bot token: ").strip() if app_key else ""
+        if not app_key:
+            warn("pumble: skipped; run `drivnx install` again when you have the keys")
+        elif not app_key.startswith("xpat") or not token:
+            fail("pumble: keys look wrong (the App key starts with xpat-); run `drivnx install` again")
+        elif run(["claude", "mcp", "add", "--scope", "user", "--transport", "http", "pumble", PUMBLE_URL,
+                  "--header", f"token: {token}", "--header", f"x-app-token: {app_key}"]).returncode == 0:
+            ok("pumble: added")
+        else:
+            fail("pumble: `claude mcp add` failed")
+    return plane_added
+
+
+def install_notifier(quiet: bool = False) -> bool:
+    """Copy the notifier, wire its hooks, make sure the settings file exists. Returns True if anything changed."""
+    if not quiet:
+        step("5. Team posts (Claude finished → #dev-activity, daily report → #daily-report)")
+    changed = False
+    NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
+    if file_hash(NOTIFIER) != file_hash(NOTIFIER_SRC):
+        shutil.copyfile(NOTIFIER_SRC, NOTIFIER)
+        changed = True
+
+    py, script = Path(python_exe()).as_posix(), NOTIFIER.as_posix()
+    wanted = {
+        "UserPromptSubmit": {"type": "command", "command": f'"{py}" "{script}" start', "timeout": 15},
+        "Stop": {"type": "command", "command": f'"{py}" "{script}" stop', "timeout": 20, "async": True},
+    }
+    try:
+        settings = json.loads(SETTINGS.read_text(encoding="utf-8")) if SETTINGS.is_file() else {}
+    except ValueError:
+        fail(f"{SETTINGS} is not valid JSON; fix it and re-run")
+        return changed
+    before = json.dumps(settings, sort_keys=True)
+    hooks = settings.setdefault("hooks", {})
+    for event, hook in wanted.items():
+        groups = []
+        for g in hooks.get(event, []):  # drop older notifier entries, keep everything else
+            kept = [h for h in g.get("hooks", []) if "pumble-notify.py" not in h.get("command", "")]
+            if kept:
+                groups.append({**g, "hooks": kept})
+        groups.append({"hooks": [hook]})
+        hooks[event] = groups
+    if json.dumps(settings, sort_keys=True) != before:
+        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+        if SETTINGS.is_file():
+            shutil.copyfile(SETTINGS, SETTINGS.with_name("settings.json.bak"))
+        SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        changed = True
+
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    conf = json.loads(CONFIG.read_text(encoding="utf-8")) if CONFIG.is_file() else {
+        "timezone": "Asia/Ho_Chi_Minh",
+        "utc_offset_hours": 7,
+        "report_hour": 23,
+        "channels": {"activity": "dev-activity", "daily": "daily-report"},
+    }
+    before_conf = json.dumps(conf, sort_keys=True) if CONFIG.is_file() else ""
+    if str(WS) not in conf.setdefault("workspaces", []):
+        conf["workspaces"] = [w for w in conf["workspaces"] if Path(os.path.expanduser(w)).resolve() != WS] + [str(WS)]
+    if not conf.get("name"):
+        conf["name"] = run(["git", "config", "--global", "user.name"]).stdout.strip()
+    if json.dumps(conf, sort_keys=True) != before_conf:
+        CONFIG.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        changed = True
+    if not quiet:
+        ok(f"hooks in {SETTINGS}")
+        ok(f"settings in {CONFIG} (your name in posts: {conf.get('name') or 'not set, edit it'})")
+    return changed
+
+
+def schedule_installed() -> bool:
+    if WINDOWS:
+        return run(["schtasks", "/Query", "/TN", TASK]).returncode == 0
+    return which("crontab") is not None and "pumble-notify.py digest" in run(["crontab", "-l"]).stdout
+
+
+def install_schedule() -> None:
+    step("6. Daily report job (checks hourly; posts after 23:00 Vietnam time)")
+    py = python_exe()
+    if WINDOWS:
+        r = run(["schtasks", "/Create", "/F", "/SC", "HOURLY", "/TN", TASK,
+                 "/TR", f'"{py}" "{NOTIFIER}" digest --due'])
+        ok(f"Task Scheduler: '{TASK}'") if r.returncode == 0 else fail(f"schtasks failed: {r.stderr.strip()}")
+        return
+    if not which("crontab"):
+        warn("crontab not found: the report will post the next time you use Claude Code instead")
+        return
+    current = run(["crontab", "-l"]).stdout.splitlines()
+    lines = [l for l in current if "pumble-notify.py digest" not in l]
+    lines.append(f'5 * * * * "{py}" "{NOTIFIER}" digest --due >/dev/null 2>&1')
+    r = run(["crontab", "-"], input="\n".join(lines) + "\n")
+    ok("crontab: hourly at :05") if r.returncode == 0 else fail(f"crontab failed: {r.stderr.strip()}")
+
+
+def install_shim() -> None:
+    step("7. The drivnx command")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    me = Path(__file__).resolve()
+    if WINDOWS:
+        shim = BIN_DIR / "drivnx.cmd"
+        shim.write_text(f'@"{sys.executable}" "{me}" %*\r\n', encoding="utf-8")
+    else:
+        me.chmod(me.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        shim = BIN_DIR / "drivnx"
+        if shim.is_symlink() or shim.exists():
+            shim.unlink()
+        shim.symlink_to(me)
+    ok(f"{shim}")
+    on_path = any(Path(p).resolve() == BIN_DIR.resolve() for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    if not on_path:
+        warn(f"{BIN_DIR} is not on your PATH. Add it, then open a new terminal:")
+        if WINDOWS:
+            print(f"      powershell -c \"[Environment]::SetEnvironmentVariable('Path', "
+                  f"[Environment]::GetEnvironmentVariable('Path','User') + ';{BIN_DIR}', 'User')\"")
+        else:
+            shell_rc = "~/.zshrc" if os.environ.get("SHELL", "").endswith("zsh") else "~/.bashrc"
+            print(f"      echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> {shell_rc}")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_install(a: argparse.Namespace) -> int:
+    print(f"DrivnX workspace: {WS}")
+    if not check_tools(a.skip_deps):
+        fail("git is required: install it and run `drivnx install` again")
+        return 1
+    clone_repos()
+    if not a.skip_deps:
+        install_deps()
+    plane_added = False if a.skip_mcp else setup_mcp()
+    install_notifier()
+    if not a.no_schedule:
+        install_schedule()
+    install_shim()
+    cmd_status(argparse.Namespace(online=False))
+    steps = ["Restart Claude Code (it loads the hooks and MCP servers when it starts)."]
+    if plane_added or "plane" in mcp_servers():
+        steps.append("Sign in to Plane once: in Claude Code type /mcp, pick plane, then Authenticate.")
+    steps.append(f"Work inside a code repo: cd {WS / 'drivnx-web'} && claude")
+    print("\nLast steps:")
+    for n, text in enumerate(steps, 1):
+        print(f"  {n}. {text}")
+    return 0
+
+
+def cmd_status(a: argparse.Namespace) -> int:
+    step(f"Repos  ({WS})")
+    for name in ["drivnx-cli", *REPOS]:
+        repo = WS / name
+        if not (repo / ".git").exists():
+            fail(f"{name:<15} not cloned (run drivnx install)")
+            continue
+        branch = git(repo, "branch", "--show-current") or "detached"
+        dirty = len(git(repo, "status", "--porcelain").splitlines())
+        counts = git(repo, "rev-list", "--left-right", "--count", "@{u}...HEAD").split()
+        sync = f"↓{counts[0]} ↑{counts[1]}" if len(counts) == 2 else "no upstream"
+        state = f"{dirty} uncommitted" if dirty else "clean"
+        (ok if not dirty else warn)(f"{name:<15} {branch:<32} {state:<15} {sync}")
+
+    step("Tools")
+    for name, (why, installer, manual) in TOOLS.items():
+        v = tool_version(name)
+        if name == "gh" and v:
+            v += " (logged in)" if gh_logged_in() else " (NOT logged in: gh auth login)"
+        (ok if v else (fail if why == "required" else warn))(f"{name:<7} {v or 'not found'}  [{why}]")
+
+    step("Claude Code")
+    servers = mcp_servers()
+    for name in ("plane", "pumble"):
+        (ok if name in servers else fail)(f"MCP {name:<7} {'configured' if name in servers else 'missing (drivnx install)'}")
+    if a.online and which("claude"):
+        for line in run(["claude", "mcp", "list"]).stdout.splitlines():
+            if line.split(":")[0].strip() in ("plane", "pumble"):
+                print(f"      {line.strip()}")
+    try:
+        cmds = json.dumps(json.loads(SETTINGS.read_text(encoding="utf-8")).get("hooks", {}))
+    except (OSError, ValueError):
+        cmds = ""
+    hooks_ok = "pumble-notify.py\\\" start" in cmds and "pumble-notify.py\\\" stop" in cmds
+    (ok if hooks_ok else fail)(f"hooks       {'start + stop' if hooks_ok else 'missing (drivnx install)'}")
+    same = file_hash(NOTIFIER) == file_hash(NOTIFIER_SRC)
+    (ok if same else warn)(f"notifier    {'up to date' if same else 'out of date (drivnx update)'}")
+    sched = schedule_installed()
+    (ok if sched else warn)(f"daily job   {'installed' if sched else 'not installed (drivnx install)'}")
+    if CONFIG.is_file():
+        c = json.loads(CONFIG.read_text(encoding="utf-8"))
+        ok(f"settings    name={c.get('name') or '?'}  timezone={c.get('timezone')}  report at {c.get('report_hour')}:00")
+    else:
+        fail("settings    missing (drivnx install)")
+
+    step("AI skills")
+    for name in REPOS[1:]:
+        repo = WS / name
+        reqs = manifest_requirements(repo)
+        if not reqs:
+            warn(f"{name:<15} no .ai/manifest.yaml")
+            continue
+        missing = [r for r in reqs if not (repo / r).exists()]
+        if missing:
+            fail(f"{name:<15} requirements not found: {', '.join(missing)} (old branch? run drivnx update)")
+        else:
+            ok(f"{name:<15} skills installed; requirements found")
+    return 0
+
+
+def cmd_update(a: argparse.Namespace) -> int:
+    step("Pulling")
+    for name in ["drivnx-cli", *REPOS]:
+        repo = WS / name
+        if not (repo / ".git").exists():
+            warn(f"{name}: not cloned (run drivnx install)")
+            continue
+        run(["git", "-C", str(repo), "fetch", "--prune", "--quiet"])
+        branch = git(repo, "branch", "--show-current")
+        if git(repo, "status", "--porcelain"):
+            warn(f"{name} ({branch}): uncommitted changes, not pulled")
+        elif not git(repo, "rev-parse", "--abbrev-ref", "@{u}"):
+            warn(f"{name} ({branch}): no upstream branch, not pulled")
+        elif run(["git", "-C", str(repo), "pull", "--ff-only", "--quiet"]).returncode == 0:
+            ok(f"{name} ({branch}): up to date")
+        else:
+            fail(f"{name} ({branch}): can't fast-forward (diverged); merge or rebase it yourself")
+    step("Setup")
+    ok("team posts refreshed" if install_notifier(quiet=True) else "team posts already current")
+    return 0
+
+
+def cmd_report(a: argparse.Namespace) -> int:
+    script = NOTIFIER if NOTIFIER.is_file() else NOTIFIER_SRC
+    args = [sys.executable, str(script), "digest", *([a.date] if a.date else [])]
+    if not a.post:
+        args.append("--dry-run")
+    r = subprocess.run(args)
+    if not a.post:
+        print("\n(preview only; `drivnx report --post` posts it to #daily-report)")
+    return r.returncode
+
+
+def cmd_skills(a: argparse.Namespace) -> int:
+    if not which("ai-skills"):
+        fail("the ai-skills CLI isn't installed (it isn't published yet: ask Trison Labs)")
+        return 1
+    bash = which("bash")
+    if not bash:
+        fail("bash not found (on Windows, use Git Bash)")
+        return 1
+    script = WS / "drivnx-docs" / "ai-skills" / "drivnx-skills.sh"
+    return subprocess.run([bash, str(script), a.action], cwd=WS).returncode
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="drivnx", description="Set up and look after the DrivnX workspace.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("install", help="set up tools, repos, dependencies, Claude Code and the team posts")
+    i.add_argument("--skip-deps", action="store_true", help="don't install the code repos' dependencies")
+    i.add_argument("--skip-mcp", action="store_true", help="don't add the Plane and Pumble MCP servers")
+    i.add_argument("--no-schedule", action="store_true", help="don't install the hourly daily-report job")
+    s = sub.add_parser("status", help="health check")
+    s.add_argument("--online", action="store_true", help="also ask Claude Code whether the MCP servers connect")
+    sub.add_parser("update", help="pull every repo (fast-forward only) and refresh the setup")
+    r = sub.add_parser("report", help="preview a daily report, or post it with --post")
+    r.add_argument("date", nargs="?", help="YYYY-MM-DD (default: today)")
+    r.add_argument("--post", action="store_true", help="post it to #daily-report")
+    k = sub.add_parser("skills", help="manage the shared AI skills")
+    k.add_argument("action", choices=["sync"])
+    a = p.parse_args()
+    return {"install": cmd_install, "status": cmd_status, "update": cmd_update,
+            "report": cmd_report, "skills": cmd_skills}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
