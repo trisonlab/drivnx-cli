@@ -61,6 +61,11 @@ DEFAULTS = {
     "channels": {"activity": "dev-activity", "daily": "daily-report"},
     "workspaces": [],
 }
+for _stream in (sys.stdout, sys.stderr):  # Windows consoles default to cp1252, which has no emoji
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
 DRY_RUN = bool(os.environ.get("PUMBLE_NOTIFY_DRY_RUN")) or "--dry-run" in sys.argv
 
 
@@ -172,9 +177,9 @@ def mcp_call(srv: dict, tool: str, args: dict) -> dict:
         return {"text": text}
 
 
-def channel_id(srv: dict, name: str) -> str:
+def channel_id(srv: dict, name: str, refresh: bool = False) -> str:
     cache = STATE_DIR / "pumble-channels.json"
-    ids = json.loads(cache.read_text()) if cache.is_file() else {}
+    ids = json.loads(cache.read_text()) if cache.is_file() and not refresh else {}
     if name not in ids:
         chans = mcp_call(srv, "get_channels", {"channelTypes": ["PUBLIC", "PRIVATE"]})
         chans = chans.get("channels", []) if isinstance(chans, dict) else chans
@@ -194,7 +199,10 @@ def post(channel: str | None, text: str) -> None:
         return
     srv = pumble_mcp()
     if srv:
-        mcp_call(srv, "send_message", {"channelId": channel_id(srv, channel), "text": text})
+        try:
+            mcp_call(srv, "send_message", {"channelId": channel_id(srv, channel), "text": text})
+        except RuntimeError:  # the channel may have been recreated: look its ID up again, once
+            mcp_call(srv, "send_message", {"channelId": channel_id(srv, channel, refresh=True), "text": text})
         return
     url = os.environ.get("PUMBLE_WEBHOOK_URL", "").strip() or (
         URL_FILE.read_text().strip() if URL_FILE.is_file() else "")
@@ -218,6 +226,9 @@ def first_prose(text: str) -> str:
         para = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", para)  # [text](url) -> text
         para = re.sub(r"(\*\*|__|`)", "", para)
         para = " ".join(para.split())
+        para = re.sub(r"(^|(?<=[.!?]))\s*[^.!?]*:$", "", para).strip()  # drop a lead-in such as "Run this:"
+        if not para:
+            continue
         if len(para) <= SUMMARY_CHARS:
             return para
         cut = para[:SUMMARY_CHARS]
@@ -411,6 +422,8 @@ def digest(args: list[str], cfg: dict) -> None:
             text = build_report(d, cfg)
             if text:
                 post(cfg["channels"].get("daily"), text)
+            elif "--due" not in args:
+                print(f"Nothing to report for {d:%a %d %b %Y}: no commits, PRs or Claude tasks yet.")
             if not DRY_RUN and "--due" in args:  # manual runs don't block the automatic one
                 posted[d.isoformat()] = time.time()
         if not DRY_RUN:

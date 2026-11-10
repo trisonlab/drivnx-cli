@@ -103,11 +103,12 @@ sprint?"*, *"Post the Thursday check-in"*.
 | `#meetings` | Thursday check-in, Saturday review / retro / plan | Claude Code, when you ask |
 | `#daily-report` | Each person's day: commits, PRs, Claude tasks, skills used. 23:00 Vietnam time | Automatic |
 | `#dev-activity` | "Claude finished" after each Claude Code task that changed files or made commits | Automatic |
-| `#pr-web`, `#pr-landing`, `#pr-docs` | PRs opened / reviewed / merged, pushes, issues, releases for that repo | Pumble GitHub app |
+| `#pr-web`, `#pr-landing`, `#pr-docs`, `#pr-cli` | PRs opened / reviewed / merged, pushes, issues, releases for that repo | Pumble GitHub app |
 | `#general` | Everything else | You |
 
-Your name and the report time come from `~/.config/drivnx/pumble.json`. Set `"activity": null` under `channels` there
-to stop the per-task posts.
+Every automatic post comes from the **Claude** bot, with your name in it. Your name and the report time come from
+`~/.config/drivnx/pumble.json`. Set `"activity": null` under `channels` there to stop the per-task posts. Working on two
+computers gives two daily reports a day, one from each: they only know their own work.
 
 ## Rules
 
@@ -125,7 +126,7 @@ to stop the per-task posts.
 | `drivnx: command not found` | Open a new terminal. If it's still missing, add `~/.local/bin` to your PATH (install printed the line) |
 | `drivnx status` shows a ✘ | Run `drivnx install` again |
 | Claude has no `send_message` tool for Pumble | The Claude app is missing scopes: the owner adds them and reinstalls it. Then `claude mcp remove pumble -s user` and `drivnx install` with the new token |
-| Nothing in `#dev-activity` or `#daily-report` | Read `~/.claude/hooks/pumble-notify.log`. "channel not found" means the Claude bot isn't in that channel |
+| Nothing in `#dev-activity` or `#daily-report` | Read `~/.claude/hooks/pumble-notify.log`. "channel not found" means it was renamed, or it's private and the Claude bot isn't in it. A daily report with no activity isn't posted |
 | A PR event is missing | The channel isn't subscribed to that repo, or it's a comment (comments aren't part of the subscription) |
 | A code repo says "requirements not found" | It's on an old branch from before the workspace layout: `drivnx update`, or merge `main` into your branch |
 
@@ -133,13 +134,14 @@ to stop the per-task posts.
 
 **Adding a teammate:** invite them to the GitHub org `trisonlab`, the Plane workspace `drivnx` (project DRIVN), the
 Pumble workspace `TrisonLab` (channels above) and the Thursday and Saturday meetings. Then send them the Claude app's
-App key and bot token in a Pumble direct message and this repo's link.
+App key and bot token in a Pumble direct message and this repo's link. Everyone, the owner too, uses the bot token, so
+posts come from the bot and nobody works with the owner's rights.
 
 **The Pumble Claude app** (Workspace settings → Configure apps). User *and* bot scopes: `messages:read`,
 `messages:write`, `files:write`, `messages:edit`, `messages:delete`, `channels:read`, `channels:list`,
 `channels:write`, `users:list`, `user:read`, `workspace:read`, `reaction:read`, `reaction:write`. Without
-`files:write` and `channels:list` the MCP server has no send or channel-list tools. The bot must be a member of
-`#meetings`, `#daily-report` and `#dev-activity`.
+`files:write` and `channels:list` the MCP server has no send or channel-list tools. The bot posts to public channels
+without being a member. It can edit its own posts but not delete them: clean up in Pumble.
 
 **The Pumble GitHub app:** on GitHub, trisonlab → Settings → GitHub Apps → *pumble-github* → give it each repo, then run
 `/github subscribe trisonlab/<repo>` in that repo's PR channel.

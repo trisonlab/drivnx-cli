@@ -19,10 +19,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: DrivnX/drivnx-cli
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: drivnx install (clones, team posts, daily job, PATH link)
@@ -41,8 +41,8 @@ jobs:
               "settings written": (home / ".config/drivnx/pumble.json").is_file(),
               "drivnx command": (home / ".local/bin" / ("drivnx.cmd" if os.name == "nt" else "drivnx")).exists(),
               "daily job": (subprocess.run(["schtasks", "/Query", "/TN", "DrivnX daily report"]).returncode == 0
-                            if os.name == "nt" else "pumble-notify.py digest" in subprocess.run(
-                                ["crontab", "-l"], capture_output=True, text=True).stdout),
+                            if os.name == "nt" else sum("pumble-notify.py" in l and "digest" in l for l in subprocess.run(
+                                ["crontab", "-l"], capture_output=True, text=True).stdout.splitlines()) == 1),
           }
           for name, good in checks.items():
               print(("PASS " if good else "FAIL ") + name)
@@ -52,6 +52,10 @@ jobs:
         run: |
           python DrivnX/drivnx-cli/drivnx install --skip-deps --skip-mcp > /dev/null
           python -c "import json,pathlib; h=json.loads((pathlib.Path.home()/'.claude/settings.json').read_text())['hooks']; assert all(len(h[e])==1 for e in h), h; print('PASS no duplicate hooks')"
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            n=$(crontab -l | grep -c 'pumble-notify.py.*digest'); [ "$n" = 1 ] || { echo "FAIL $n cron lines"; exit 1; }
+            echo "PASS one cron line"
+          fi
       - name: drivnx status and report
         run: |
           python DrivnX/drivnx-cli/drivnx status
