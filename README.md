@@ -96,7 +96,8 @@ and GitHub and posts a summary to `#meetings`. After Saturday's meeting, close t
 1. Pick a work item from the current cycle in Plane, assign it to yourself, move it to *In Progress*.
 2. Branch as `feat/<plane-key>-short-name` (e.g. `feat/drivn-31-login-form`).
 3. Open the PR with the Plane key at the start of the title (`DRIVN-31: Add the login form`). Its repo's PR channel
-   gets it.
+   gets it, description included, as raw text: write a short paragraph and plain `- ` bullets, with no headings,
+   tables, backticks or `[text](url)` links. Every edit reposts the whole description.
 4. After review, squash-merge and move the item to *Done*.
 
 Things you can ask Claude Code: *"Move DRIVN-31 to Done and say so in #meetings"*, *"What's still open in this
