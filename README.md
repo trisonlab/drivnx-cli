@@ -16,9 +16,15 @@ curl -fsSL https://raw.githubusercontent.com/trisonlab/drivnx-cli/main/get.sh | 
 irm https://raw.githubusercontent.com/trisonlab/drivnx-cli/main/get.ps1 | iex
 ```
 
-You only need **git** and **Python 3.10+** first. The command creates `~/DrivnX`, downloads this tool into it and runs
-`drivnx install`, which takes care of the rest. Run it in a normal terminal, not inside Claude Code: it asks questions
-and two secret keys.
+You only need **git** and **Python 3.10+** first. The command creates a `DrivnX` folder in the folder you run it from,
+downloads this tool into it and runs `drivnx install`, which takes care of the rest. A new terminal starts in your home
+folder, so that gives `~/DrivnX`. Run from a folder that's already named `DrivnX`, it uses that folder; to choose
+another, set `DRIVNX_HOME` (`curl … | DRIVNX_HOME=~/work/DrivnX sh`, or `$env:DRIVNX_HOME` on Windows). It prints the
+folder first, and stops if that folder already holds files that aren't a DrivnX workspace. Run it in a normal
+terminal, not inside Claude Code: it asks questions and two secret keys.
+
+Only the repos go in that folder. Everything else in [What it changes on your computer](#what-it-changes-on-your-computer)
+is per user, so a second workspace shares it, and `drivnx` runs the copy from the workspace you installed last.
 
 Prefer to see each step? This does the same:
 
@@ -150,7 +156,7 @@ without being a member. It can edit its own posts but not delete them: clean up 
 
 | Where | What |
 |---|---|
-| `~/DrivnX/` | The four repos |
+| `DrivnX/` where you ran it (usually `~/DrivnX/`) | The four repos |
 | `~/.claude.json` | The Plane and Pumble MCP servers (via `claude mcp add`; the Pumble keys live here) |
 | `~/.claude/settings.json` | Two hooks that run the notifier (a backup is kept as `settings.json.bak`) |
 | `~/.claude/hooks/pumble-notify.py` | The notifier, copied from `notifier/` here |
