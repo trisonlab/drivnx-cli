@@ -131,6 +131,13 @@ def snapshot(repo: Path) -> dict:
     }
 
 
+def web_url(repo: Path) -> str:
+    """https://host/owner/repo for the repo's origin remote, or "" if it has none."""
+    remote = git(repo, "remote", "get-url", "origin").strip()
+    m = re.fullmatch(r"(?:https?://|ssh://)?(?:[^@/]+@)?([^/:]+)[:/](.+?)(?:\.git)?/?", remote)
+    return f"https://{m[1]}/{m[2]}" if m else ""
+
+
 def new_commits(repo: Path, since_head: str) -> list[list[str]]:
     if not since_head:
         return []
@@ -356,25 +363,28 @@ def build_report(day: date, cfg: dict) -> str:
     sections = []
     for repo in known_repos(cfg, turns):
         email = git(repo, "config", "user.email").strip()
-        commits = git(repo, "log", "--all", "--no-merges", f"--author={email}", "--format=%h%x09%s",
+        commits = git(repo, "log", "--all", "--no-merges", f"--author={email}", "--format=%H%x09%h%x09%s",
                       f"--since={start.isoformat()}", f"--until={end.isoformat()}").splitlines() if email else []
         seen, unique = set(), []  # a squash-merge repeats the branch commit as "subject (#N)"
         for c in commits:
-            key = re.sub(r"\s*\(#\d+\)$", "", c.split("\t", 1)[-1])
+            full, short, subject = c.split("\t", 2)
+            key = re.sub(r"\s*\(#\d+\)$", "", subject)
             if key not in seen:
                 seen.add(key)
-                unique.append(c)
-        commits = unique
+                unique.append((full, short, subject))
+        commits, url = unique, web_url(repo)
         prs = []
         try:
             r = subprocess.run(["gh", "pr", "list", "--author", "@me", "--state", "all", "--limit", "30",
-                                "--json", "number,title,state,createdAt,mergedAt"],
+                                "--json", "number,title,state,createdAt,mergedAt,url"],
                                cwd=repo, capture_output=True, text=True, timeout=20)
             for pr in json.loads(r.stdout or "[]"):
                 for key, label in (("mergedAt", "merged"), ("createdAt", "opened")):
                     ts = pr.get(key)
                     if ts and start <= datetime.fromisoformat(ts.replace("Z", "+00:00")) < end:
-                        prs.append(f"#{pr['number']} {pr['title']} ({label})")
+                        num = f"#{pr['number']}"
+                        link = f"[{num}]({pr['url']})" if pr.get("url") else num
+                        prs.append(f"{link} {pr['title']} ({label})")
                         break
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
@@ -384,7 +394,8 @@ def build_report(day: date, cfg: dict) -> str:
         lines = [f"**{repo.name}**"]
         if commits:
             lines.append(f"- Commits ({len(commits)}): " + ", ".join(
-                f"`{c.split(chr(9))[0]}` {c.split(chr(9), 1)[-1]}" for c in commits[:MAX_COMMITS])
+                f"{f'[{short}]({url}/commit/{full})' if url else f'`{short}`'} {subject}"
+                for full, short, subject in commits[:MAX_COMMITS])
                 + (f", … +{len(commits) - MAX_COMMITS}" if len(commits) > MAX_COMMITS else ""))
         if prs:
             lines.append("- PRs: " + "; ".join(prs))
@@ -394,7 +405,7 @@ def build_report(day: date, cfg: dict) -> str:
     if not sections:
         return ""
 
-    out = [f"**📋 Daily report** · {person(cfg)} · {day.strftime('%a %d %b %Y')}", *sections]
+    out = [f"# {person(cfg).upper()}\n**📋 Daily report** · {day.strftime('%a %d %b %Y')}", *sections]
     skills = Counter(s for t in turns for s in t.get("skills", []))
     if skills:
         out.append("**Skills used:** " + ", ".join(f"{s} ×{n}" for s, n in skills.most_common()))
