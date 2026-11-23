@@ -73,10 +73,10 @@ Each repo's `CONTRIBUTING.md` explains its own workflow.
 
 | Command | What it does |
 |---|---|
-| `drivnx install` | Set up, or repair, everything above. `--skip-deps`, `--skip-mcp`, `--no-schedule` leave a step out |
-| `drivnx status` | Health check: each repo's branch and changes, tools, Plane and Pumble, hooks, daily job, AI skills. `--online` also tests the connections |
+| `drivnx install` | Set up, or repair, everything above. `--skip-deps`, `--skip-mcp`, `--no-schedule` leave a step out. `--claude-config DIR` sets up another Claude Code account (see [More than one Claude account](#more-than-one-claude-account)) |
+| `drivnx status` | Health check: each repo's branch and changes, tools, Plane and Pumble, hooks, daily job, profiles, AI skills. `--online` also tests the connections |
 | `drivnx update` | Pulls all four repos (fast-forward only; a repo with uncommitted changes is skipped) and refreshes the team posts |
-| `drivnx report` | Previews today's daily report. `--post` posts it now |
+| `drivnx report` | Previews today's daily report. `--post` posts it now. `--profile NAME` picks another account's report |
 | `drivnx skills sync` | Applies `drivnx-docs/ai-skills/baseline.txt` to every code repo (needs the `ai-skills` CLI) |
 
 ## How we work
@@ -114,8 +114,21 @@ sprint?"*, *"Post the Thursday check-in"*.
 | `#general` | Everything else | You |
 
 Every automatic post comes from the **Claude** bot, with your name in it. Your name and the report time come from
-`~/.config/drivnx/pumble.json`. Set `"activity": null` under `channels` there to stop the per-task posts. Working on two
-computers gives two daily reports a day, one from each: they only know their own work.
+your profile, `~/.config/drivnx/profiles/<name>.json` (`default.json` for the usual Claude Code setup). Set
+`"activity": null` under `channels` there to stop the per-task posts. Working on two computers gives two daily
+reports a day, one from each: they only know their own work.
+
+### More than one Claude account
+
+If you run Claude Code with several accounts (`CLAUDE_CONFIG_DIR=~/.claude-<name> claude`, for example one per
+company), each account has its own Pumble keys and can post to its own Pumble workspace. Run
+`drivnx install --claude-config ~/.claude-<name>` once for each account. It adds that account's hooks and a profile
+named after it (`~/.claude-drivnx` → `drivnx`), with its own channels, name and report history.
+
+- A Claude Code session posts with the profile of the account it runs in. An account without a profile posts nothing.
+- The hourly job posts every profile's daily report, each with that account's keys.
+- The first `drivnx install` after upgrading turns the old `~/.config/drivnx/pumble.json` into a profile for the
+  account you run it with, keeping the report history. The old file stays as `pumble.json.migrated`.
 
 ## Rules
 
@@ -133,7 +146,7 @@ computers gives two daily reports a day, one from each: they only know their own
 | `drivnx: command not found` | Open a new terminal. If it's still missing, add `~/.local/bin` to your PATH (install printed the line) |
 | `drivnx status` shows a ✘ | Run `drivnx install` again |
 | Claude has no `send_message` tool for Pumble | The Claude app is missing scopes: the owner adds them and reinstalls it. Then `claude mcp remove pumble -s user` and `drivnx install` with the new token |
-| Nothing in `#dev-activity` or `#daily-report` | Read `~/.claude/hooks/pumble-notify.log`. "channel not found" means it was renamed, or it's private and the Claude bot isn't in it. A daily report with no activity isn't posted |
+| Nothing in `#dev-activity` or `#daily-report` | Read `~/.claude/hooks/pumble-notify.log`. "channel not found" means it was renamed, or it's private and the Claude bot isn't in it. "401" means the Pumble keys of that profile's account are out of date: run `drivnx status` to see which account. A daily report with no activity isn't posted |
 | A PR event is missing | The channel isn't subscribed to that repo, or it's a comment (comments aren't part of the subscription) |
 | A code repo says "requirements not found" | It's on an old branch from before the workspace layout: `drivnx update`, or merge `main` into your branch |
 
@@ -158,10 +171,10 @@ without being a member. It can edit its own posts but not delete them: clean up 
 | Where | What |
 |---|---|
 | `DrivnX/` where you ran it (usually `~/DrivnX/`) | The four repos |
-| `~/.claude.json` | The Plane and Pumble MCP servers (via `claude mcp add`; the Pumble keys live here) |
-| `~/.claude/settings.json` | Two hooks that run the notifier (a backup is kept as `settings.json.bak`) |
-| `~/.claude/hooks/pumble-notify.py` | The notifier, copied from `notifier/` here |
-| `~/.config/drivnx/pumble.json` | Your name, timezone, report time and channels (no secrets) |
+| `~/.claude.json` | The Plane and Pumble MCP servers (via `claude mcp add`; the Pumble keys live here). For another account: `~/.claude-<name>/.claude.json` |
+| `~/.claude/settings.json` | Two hooks that run the notifier (a backup is kept as `settings.json.bak`). For another account: `~/.claude-<name>/settings.json` |
+| `~/.claude/hooks/pumble-notify.py` | The notifier, copied from `notifier/` here. Its state is in `~/.claude/hooks/state/<profile>/` |
+| `~/.config/drivnx/profiles/<name>.json` | One per Claude account: your name, timezone, report time and channels (no secrets) |
 | crontab / Task Scheduler | One hourly line / task, "DrivnX daily report" |
 | `~/.local/bin/drivnx` | The command (a link to this repo's `drivnx`; `drivnx.cmd` on Windows) |
 

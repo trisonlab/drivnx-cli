@@ -38,7 +38,7 @@ jobs:
               "notifier copied": (home / ".claude/hooks/pumble-notify.py").is_file(),
               "hooks wired": all("pumble-notify.py" in json.dumps(json.loads((home / ".claude/settings.json").read_text())["hooks"][e])
                                  for e in ("UserPromptSubmit", "Stop")),
-              "settings written": (home / ".config/drivnx/pumble.json").is_file(),
+              "profile written": json.loads((home / ".config/drivnx/profiles/default.json").read_text())["claude_config_dir"] == "~/.claude",
               "drivnx command": (home / ".local/bin" / ("drivnx.cmd" if os.name == "nt" else "drivnx")).exists(),
               "daily job": (subprocess.run(["schtasks", "/Query", "/TN", "DrivnX daily report"]).returncode == 0
                             if os.name == "nt" else sum("pumble-notify.py" in l and "digest" in l for l in subprocess.run(
@@ -79,3 +79,30 @@ jobs:
           echo "$out"
           echo "$out" | grep -q "CI test commit" || { echo "FAIL commit not in the post"; exit 1; }
           echo "PASS posts the commit"
+      - name: A second Claude account gets its own profile; an account without one posts nothing
+        run: |
+          set -eu
+          python DrivnX/drivnx-cli/drivnx install --skip-deps --skip-mcp --no-schedule --claude-config '~/.claude-second' > /dev/null
+          python - <<'EOF'
+          import json, sys
+          from pathlib import Path
+          home = Path.home()
+          checks = {
+              "two profiles": sorted(f.stem for f in (home / ".config/drivnx/profiles").glob("*.json")) == ["default", "second"],
+              "second account's hooks": "pumble-notify.py" in (home / ".claude-second/settings.json").read_text(),
+              "state kept per profile": (home / ".claude/hooks/state/default/daily").is_dir(),
+          }
+          for name, good in checks.items():
+              print(("PASS " if good else "FAIL ") + name)
+          sys.exit(0 if all(checks.values()) else 1)
+          EOF
+          python DrivnX/drivnx-cli/drivnx report --profile second
+          n="$HOME/.claude/hooks/pumble-notify.py"
+          cd DrivnX/drivnx-web
+          dir=$(pwd -W 2>/dev/null || pwd)
+          hook() { echo "{\"session_id\":\"ci2\",\"cwd\":\"$dir\"}" | CLAUDE_CONFIG_DIR='~/.claude-none' PUMBLE_NOTIFY_DRY_RUN=1 python "$n" "$1"; }
+          hook start
+          git commit -q --allow-empty -m "CI second commit"
+          out=$(hook stop)
+          [ -z "$out" ] || { echo "FAIL an account without a profile posted: $out"; exit 1; }
+          echo "PASS silent for an account without a profile"
