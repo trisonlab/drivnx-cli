@@ -6,18 +6,25 @@ Modes
     stop            Stop hook: if the turn changed files or made commits, post "Claude finished" to the
                     activity channel and log the turn (commits, summary, skills used) for the daily report.
     digest [DATE]   Post the daily report for DATE (YYYY-MM-DD, default today).
-    digest --due    Post every daily report that is due and not yet posted (run hourly by cron).
+    digest --due    Post every daily report that is due and not yet posted, for every profile (run hourly by cron).
+    Add --profile NAME to digest to pick one profile.
     Add --dry-run (or env PUMBLE_NOTIFY_DRY_RUN=1) to print instead of posting.
 
-How it posts: through the Pumble MCP server configured in Claude Code (~/.claude.json, mcpServers.pumble,
+How it posts: through the Pumble MCP server configured in Claude Code (mcpServers.pumble in .claude.json,
 added with `claude mcp add --scope user ... pumble`), so no extra Pumble app is needed. If that is missing,
-"Claude finished" posts fall back to an incoming-webhook URL ($PUMBLE_WEBHOOK_URL or
-~/.config/drivnx/pumble-webhook). Secrets never live in a repo.
+"Claude finished" posts fall back to an incoming-webhook URL ($PUMBLE_WEBHOOK_URL or the profile's .webhook file).
+Secrets never live in a repo.
 
-Settings (no secrets): ~/.config/drivnx/pumble.json, e.g.
-    {"timezone": "Asia/Ho_Chi_Minh", "report_hour": 23, "name": "Kouvuli",
-     "channels": {"activity": "dev-activity", "daily": "daily-report"},
+Profiles: one per Claude Code account (config folder), so each account posts to its own Pumble workspace.
+~/.config/drivnx/profiles/NAME.json holds the settings (no secrets), e.g.
+    {"claude_config_dir": "~/.claude-drivnx", "timezone": "Asia/Ho_Chi_Minh", "report_hour": 23,
+     "name": "Kouvuli", "channels": {"activity": "dev-activity", "daily": "daily-report"},
      "workspaces": ["~/Desktop/DrivnX"]}
+The Pumble keys are read from that account's .claude.json: ~/.claude.json for the default account (~/.claude),
+otherwise <claude_config_dir>/.claude.json. Hooks post with the profile of the account they run in
+($CLAUDE_CONFIG_DIR); an account without a profile posts nothing. Each profile keeps its own state in
+~/.claude/hooks/state/NAME/.
+Without a profiles folder, the older single ~/.config/drivnx/pumble.json is used, with the account Claude runs in.
 Set "activity" to null to stop per-task posts. Errors go to ~/.claude/hooks/pumble-notify.log and never
 block Claude.
 """
@@ -46,12 +53,13 @@ except ImportError:  # Windows
         msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
 
 HOME = Path.home()
-STATE_DIR = HOME / ".claude" / "hooks" / "state"
-DAILY_DIR = STATE_DIR / "daily"
+STATE_ROOT = HOME / ".claude" / "hooks" / "state"
 LOG = HOME / ".claude" / "hooks" / "pumble-notify.log"
-CONFIG_FILE = HOME / ".config" / "drivnx" / "pumble.json"
-URL_FILE = HOME / ".config" / "drivnx" / "pumble-webhook"
-CLAUDE_JSON = HOME / ".claude.json"
+CONFIG_DIR = HOME / ".config" / "drivnx"
+PROFILES_DIR = CONFIG_DIR / "profiles"
+LEGACY_CONFIG = CONFIG_DIR / "pumble.json"
+LEGACY_URL_FILE = CONFIG_DIR / "pumble-webhook"
+DEFAULT_CLAUDE_DIR = HOME / ".claude"
 SUMMARY_CHARS = 300
 MAX_COMMITS = 5
 DEFAULTS = {
@@ -77,13 +85,49 @@ def log(msg: str) -> None:
         pass
 
 
-def config() -> dict:
+# ---------------------------------------------------------------- profiles
+
+def claude_dir(raw: str | None = None) -> Path:
+    """A Claude Code config folder; by default the one this process runs under ($CLAUDE_CONFIG_DIR)."""
+    raw = os.environ.get("CLAUDE_CONFIG_DIR", "") if raw is None else raw
+    return Path(os.path.expanduser(raw)).resolve() if raw.strip() else DEFAULT_CLAUDE_DIR.resolve()
+
+
+def claude_json(cdir: Path) -> Path:
+    """Where that account keeps its MCP servers (and so the Pumble keys)."""
+    return HOME / ".claude.json" if cdir == DEFAULT_CLAUDE_DIR.resolve() else cdir / ".claude.json"
+
+
+def load_profile(path: Path, name: str, cdir: Path, state: Path, webhook: Path) -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))
-    if CONFIG_FILE.is_file():
-        user = json.loads(CONFIG_FILE.read_text())
-        cfg["channels"].update(user.pop("channels", {}) or {})
-        cfg.update(user)
+    user = json.loads(path.read_text()) if path.is_file() else {}
+    cfg["channels"].update(user.pop("channels", {}) or {})
+    cfg.update(user)
+    cfg.update(_name=name, _cdir=cdir, _claude_json=claude_json(cdir), _state=state, _webhook=webhook)
     return cfg
+
+
+def profiles() -> list[dict]:
+    files = sorted(PROFILES_DIR.glob("*.json")) if PROFILES_DIR.is_dir() else []
+    if not files:  # before profiles: one settings file, used with whichever account Claude runs in
+        return [load_profile(LEGACY_CONFIG, "", claude_dir(), STATE_ROOT, LEGACY_URL_FILE)]
+    out = []
+    for f in files:
+        try:
+            cdir = claude_dir(json.loads(f.read_text()).get("claude_config_dir") or str(DEFAULT_CLAUDE_DIR))
+            out.append(load_profile(f, f.stem, cdir, STATE_ROOT / f.stem, f.with_suffix(".webhook")))
+        except (OSError, ValueError) as e:  # one broken profile shouldn't stop the others
+            log(f"profile {f.name}: {type(e).__name__}: {e}")
+    return out
+
+
+def current_profile() -> dict | None:
+    """The profile of the Claude account this process runs under, or None if it has none."""
+    found = profiles()
+    if len(found) == 1 and not found[0]["_name"]:
+        return found[0]
+    here = claude_dir()
+    return next((p for p in found if p["_cdir"] == here), None)
 
 
 def person(cfg: dict) -> str:
@@ -147,9 +191,9 @@ def new_commits(repo: Path, since_head: str) -> list[list[str]]:
 
 # ---------------------------------------------------------------- posting
 
-def pumble_mcp() -> dict | None:
+def pumble_mcp(cfg: dict) -> dict | None:
     try:
-        srv = json.loads(CLAUDE_JSON.read_text()).get("mcpServers", {}).get("pumble")
+        srv = json.loads(cfg["_claude_json"].read_text()).get("mcpServers", {}).get("pumble")
     except (OSError, ValueError):
         return None
     return srv if srv and srv.get("url") and srv.get("headers") else None
@@ -184,36 +228,37 @@ def mcp_call(srv: dict, tool: str, args: dict) -> dict:
         return {"text": text}
 
 
-def channel_id(srv: dict, name: str, refresh: bool = False) -> str:
-    cache = STATE_DIR / "pumble-channels.json"
+def channel_id(cfg: dict, srv: dict, name: str, refresh: bool = False) -> str:
+    cache = cfg["_state"] / "pumble-channels.json"  # per profile: each workspace has its own channel IDs
     ids = json.loads(cache.read_text()) if cache.is_file() and not refresh else {}
     if name not in ids:
         chans = mcp_call(srv, "get_channels", {"channelTypes": ["PUBLIC", "PRIVATE"]})
         chans = chans.get("channels", []) if isinstance(chans, dict) else chans
         ids = {c["name"]: c["id"] for c in chans}
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(ids))
     if name not in ids:
         raise RuntimeError(f"Pumble channel #{name} not found")
     return ids[name]
 
 
-def post(channel: str | None, text: str) -> None:
+def post(cfg: dict, channel: str | None, text: str) -> None:
     if not channel:
         return
     if DRY_RUN:
-        print(f"--- to #{channel} ---\n{text}")
+        where = f" (profile {cfg['_name']})" if cfg["_name"] else ""
+        print(f"--- to #{channel}{where} ---\n{text}")
         return
-    srv = pumble_mcp()
+    srv = pumble_mcp(cfg)
     if srv:
         try:
-            mcp_call(srv, "send_message", {"channelId": channel_id(srv, channel), "text": text})
+            mcp_call(srv, "send_message", {"channelId": channel_id(cfg, srv, channel), "text": text})
         except RuntimeError:  # the channel may have been recreated: look its ID up again, once
-            mcp_call(srv, "send_message", {"channelId": channel_id(srv, channel, refresh=True), "text": text})
+            mcp_call(srv, "send_message", {"channelId": channel_id(cfg, srv, channel, refresh=True), "text": text})
         return
     url = os.environ.get("PUMBLE_WEBHOOK_URL", "").strip() or (
-        URL_FILE.read_text().strip() if URL_FILE.is_file() else "")
-    if url and channel == config()["channels"].get("activity"):
+        cfg["_webhook"].read_text().strip() if cfg["_webhook"].is_file() else "")
+    if url and channel == cfg["channels"].get("activity"):
         req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(), method="POST",
                                      headers={"Content-Type": "application/json",
                                               "User-Agent": "claude-code-pumble-notify"})
@@ -277,37 +322,38 @@ def read_turn(payload: dict) -> tuple[str, list[str]]:
 
 # ---------------------------------------------------------------- hooks
 
-def state_file(session_id: str) -> Path:
+def state_file(cfg: dict, session_id: str) -> Path:
     safe = "".join(c for c in session_id if c.isalnum() or c in "-_") or "unknown"
-    return STATE_DIR / f"pumble-{safe}.json"
+    return cfg["_state"] / f"pumble-{safe}.json"
 
 
-def save(session_id: str, snaps: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    state_file(session_id).write_text(json.dumps(snaps))
+def save(cfg: dict, session_id: str, snaps: dict) -> None:
+    cfg["_state"].mkdir(parents=True, exist_ok=True)
+    state_file(cfg, session_id).write_text(json.dumps(snaps))
     cutoff = time.time() - 7 * 86400  # tidy up old sessions
-    for f in STATE_DIR.glob("pumble-*.json"):
+    for f in cfg["_state"].glob("pumble-*.json"):
         if f.name != "pumble-channels.json" and f.stat().st_mtime < cutoff:
             f.unlink(missing_ok=True)
 
 
 def on_start(payload: dict, cfg: dict) -> None:
     cwd = Path(payload.get("cwd") or os.getcwd())
-    save(payload.get("session_id", "unknown"), {str(r): snapshot(r) for r in repos_under(cwd)})
+    save(cfg, payload.get("session_id", "unknown"), {str(r): snapshot(r) for r in repos_under(cwd)})
     if not DRY_RUN:  # catch up on a missed daily report without slowing the prompt down
         detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
                   if os.name == "nt" else {"start_new_session": True})
-        subprocess.Popen([sys.executable, __file__, "digest", "--due"], stdin=subprocess.DEVNULL,
+        only = ["--profile", cfg["_name"]] if cfg["_name"] else []
+        subprocess.Popen([sys.executable, __file__, "digest", "--due", *only], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **detach)
 
 
 def on_stop(payload: dict, cfg: dict) -> None:
     session_id = payload.get("session_id", "unknown")
     cwd = Path(payload.get("cwd") or os.getcwd())
-    sf = state_file(session_id)
+    sf = state_file(cfg, session_id)
     before = json.loads(sf.read_text()) if sf.is_file() else {}
     now = {str(r): snapshot(r) for r in repos_under(cwd)}
-    save(session_id, now)  # next turn compares against this point
+    save(cfg, session_id, now)  # next turn compares against this point
 
     changed = [r for r, snap in now.items() if r in before and snap != before[r]]
     summary, skills = read_turn(payload)
@@ -322,8 +368,8 @@ def on_stop(payload: dict, cfg: dict) -> None:
         })
     if entries or skills:
         day = now_local(cfg).date().isoformat()
-        DAILY_DIR.mkdir(parents=True, exist_ok=True)
-        with (DAILY_DIR / f"{day}.jsonl").open("a") as f:
+        daily_dir(cfg).mkdir(parents=True, exist_ok=True)
+        with (daily_dir(cfg) / f"{day}.jsonl").open("a") as f:
             f.write(json.dumps({"ts": time.time(), "session": session_id, "summary": summary,
                                 "skills": skills, "repos": entries}) + "\n")
     if not entries:
@@ -342,10 +388,14 @@ def on_stop(payload: dict, cfg: dict) -> None:
         parts.append("\n".join(lines))
     if summary:
         parts.append(f"> {summary}")
-    post(cfg["channels"].get("activity"), "\n\n".join(parts))
+    post(cfg, cfg["channels"].get("activity"), "\n\n".join(parts))
 
 
 # ---------------------------------------------------------------- daily report
+
+def daily_dir(cfg: dict) -> Path:
+    return cfg["_state"] / "daily"
+
 
 def known_repos(cfg: dict, turns: list[dict]) -> list[Path]:
     paths = {Path(e["path"]) for t in turns for e in t.get("repos", [])}
@@ -357,7 +407,7 @@ def known_repos(cfg: dict, turns: list[dict]) -> list[Path]:
 def build_report(day: date, cfg: dict) -> str:
     start = datetime(day.year, day.month, day.day, tzinfo=local_tz(cfg))
     end = start + timedelta(days=1)
-    f = DAILY_DIR / f"{day.isoformat()}.jsonl"
+    f = daily_dir(cfg) / f"{day.isoformat()}.jsonl"
     turns = [json.loads(l) for l in f.read_text().splitlines() if l.strip()] if f.is_file() else []
 
     sections = []
@@ -416,14 +466,15 @@ def build_report(day: date, cfg: dict) -> str:
 
 
 def digest(args: list[str], cfg: dict) -> None:
-    DAILY_DIR.mkdir(parents=True, exist_ok=True)
-    with (DAILY_DIR / ".lock").open("w") as lock:
+    dd = daily_dir(cfg)
+    dd.mkdir(parents=True, exist_ok=True)
+    with (dd / ".lock").open("w") as lock:
         lock_file(lock)
-        posted_file = DAILY_DIR / "posted.json"
+        posted_file = dd / "posted.json"
         posted = json.loads(posted_file.read_text()) if posted_file.is_file() else {}
         now = now_local(cfg)
         if "--due" in args:
-            days = sorted(date.fromisoformat(p.stem) for p in DAILY_DIR.glob("*.jsonl"))
+            days = sorted(date.fromisoformat(p.stem) for p in dd.glob("*.jsonl"))
             days = [d for d in days if d.isoformat() not in posted and d >= now.date() - timedelta(days=7)
                     and (d < now.date() or now.hour >= int(cfg["report_hour"]))]
         else:
@@ -432,26 +483,48 @@ def digest(args: list[str], cfg: dict) -> None:
         for d in days:
             text = build_report(d, cfg)
             if text:
-                post(cfg["channels"].get("daily"), text)
+                post(cfg, cfg["channels"].get("daily"), text)
             elif "--due" not in args:
                 print(f"Nothing to report for {d:%a %d %b %Y}: no commits, PRs or Claude tasks yet.")
             if not DRY_RUN and "--due" in args:  # manual runs don't block the automatic one
                 posted[d.isoformat()] = time.time()
         if not DRY_RUN:
             posted_file.write_text(json.dumps(posted))
-        for p in DAILY_DIR.glob("*.jsonl"):  # keep 30 days of logs
+        for p in dd.glob("*.jsonl"):  # keep 30 days of logs
             if p.stat().st_mtime < time.time() - 30 * 86400:
                 p.unlink(missing_ok=True)
 
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    cfg = config()
     if mode in ("start", "stop"):
         payload = json.loads(sys.stdin.read() or "{}")
-        (on_start if mode == "start" else on_stop)(payload, cfg)
+        cfg = current_profile()
+        if cfg:  # an account without a profile isn't set up to post anywhere
+            (on_start if mode == "start" else on_stop)(payload, cfg)
     elif mode == "digest":
-        digest(sys.argv[2:], cfg)
+        args = sys.argv[2:]
+        name = args[args.index("--profile") + 1] if "--profile" in args[:-1] else ""
+        found = profiles()
+        if name:
+            targets = [p for p in found if p["_name"] == name]
+            if not targets:
+                raise RuntimeError(f"no profile named {name!r} in {PROFILES_DIR}")
+        elif "--due" in args:  # the scheduled job: every profile
+            targets = found
+        else:
+            cur = current_profile()
+            targets = [cur] if cur else found if len(found) == 1 else []
+            if not targets:
+                raise RuntimeError("this Claude account has no profile; pick one with --profile: "
+                                   + ", ".join(p["_name"] for p in found))
+        for cfg in targets:
+            try:
+                digest(args, cfg)
+            except Exception as e:  # one workspace failing shouldn't stop the others
+                if DRY_RUN or len(targets) == 1:
+                    raise
+                log(f"['digest'] profile {cfg['_name']}: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

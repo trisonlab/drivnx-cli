@@ -4,8 +4,11 @@
     drivnx install [--skip-deps] [--skip-mcp] [--no-schedule]   set up everything (safe to re-run)
     drivnx status [--online]                                      health check
     drivnx update                                                 pull every repo (fast-forward only), refresh setup
-    drivnx report [YYYY-MM-DD] [--post]                           preview (or post) a daily report
+    drivnx report [YYYY-MM-DD] [--post] [--profile NAME]          preview (or post) a daily report
     drivnx skills sync                                            apply drivnx-docs/ai-skills/baseline.txt everywhere
+
+install, status and report work on the Claude Code account in $CLAUDE_CONFIG_DIR (default ~/.claude); pass
+--claude-config DIR to pick another. Each account gets its own team-posts profile, so it posts to its own Pumble.
 
 The workspace is the folder that holds this repo (drivnx-cli) next to drivnx-docs, drivnx-web and drivnx-landing.
 Linux, macOS and Windows; Python 3.10+; standard library only.
@@ -44,9 +47,18 @@ CLI = Path(__file__).resolve().parent
 WS = CLI.parent
 NOTIFIER_SRC = CLI / "notifier" / "pumble-notify.py"
 NOTIFIER = HOME / ".claude" / "hooks" / "pumble-notify.py"
-SETTINGS = HOME / ".claude" / "settings.json"
-CLAUDE_JSON = HOME / ".claude.json"
-CONFIG = HOME / ".config" / "drivnx" / "pumble.json"
+STATE_ROOT = HOME / ".claude" / "hooks" / "state"
+DEFAULT_CLAUDE_DIR = HOME / ".claude"
+CONFIG_DIR = HOME / ".config" / "drivnx"
+PROFILES_DIR = CONFIG_DIR / "profiles"
+LEGACY_CONFIG = CONFIG_DIR / "pumble.json"  # before profiles: one settings file for everything
+LEGACY_URL_FILE = CONFIG_DIR / "pumble-webhook"
+NEW_PROFILE = {
+    "timezone": "Asia/Ho_Chi_Minh",
+    "utc_offset_hours": 7,
+    "report_hour": 23,
+    "channels": {"activity": "dev-activity", "daily": "daily-report"},
+}
 BIN_DIR = HOME / ".local" / "bin"
 TASK = "DrivnX daily report"
 
@@ -125,11 +137,58 @@ def file_hash(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else ""
 
 
-def mcp_servers() -> dict:
+# ---------------------------------------------------------------- Claude accounts and profiles
+
+def claude_dir(raw: str | None = None) -> Path:
+    """A Claude Code config folder; by default the account this runs under ($CLAUDE_CONFIG_DIR)."""
+    raw = os.environ.get("CLAUDE_CONFIG_DIR", "") if raw is None else raw
+    return Path(os.path.expanduser(raw)).resolve() if raw.strip() else DEFAULT_CLAUDE_DIR.resolve()
+
+
+def claude_json(cdir: Path) -> Path:
+    return HOME / ".claude.json" if cdir == DEFAULT_CLAUDE_DIR.resolve() else cdir / ".claude.json"
+
+
+def settings_file(cdir: Path) -> Path:
+    return cdir / "settings.json"
+
+
+def tilde(p: Path) -> str:
     try:
-        return json.loads(CLAUDE_JSON.read_text(encoding="utf-8")).get("mcpServers", {})
+        return "~/" + p.relative_to(HOME).as_posix()
+    except ValueError:
+        return str(p)
+
+
+def profile_files() -> list[Path]:
+    return sorted(PROFILES_DIR.glob("*.json")) if PROFILES_DIR.is_dir() else []
+
+
+def read_json(p: Path) -> dict:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+
+
+def profile_cdir(p: Path) -> Path:
+    return claude_dir(read_json(p).get("claude_config_dir") or str(DEFAULT_CLAUDE_DIR))
+
+
+def profile_for(cdir: Path) -> Path | None:
+    return next((p for p in profile_files() if profile_cdir(p) == cdir), None)
+
+
+def profile_name(cdir: Path) -> str:
+    """~/.claude -> default, ~/.claude-drivnx -> drivnx, anything else -> its folder name."""
+    if cdir == DEFAULT_CLAUDE_DIR.resolve():
+        return "default"
+    name = cdir.name.lstrip(".")
+    return name[len("claude-"):] if name.startswith("claude-") and len(name) > len("claude-") else name
+
+
+def mcp_servers(cdir: Path | None = None) -> dict:
+    return read_json(claude_json(cdir or claude_dir())).get("mcpServers", {})
 
 
 def gh_logged_in() -> bool:
@@ -259,26 +318,27 @@ def setup_mcp() -> bool:
     return plane_added
 
 
-def install_notifier(quiet: bool = False) -> bool:
-    """Copy the notifier, wire its hooks, make sure the settings file exists. Returns True if anything changed."""
-    if not quiet:
-        step("5. Team posts (Claude finished → #dev-activity, daily report → #daily-report)")
-    changed = False
+def copy_notifier() -> bool:
     NOTIFIER.parent.mkdir(parents=True, exist_ok=True)
-    if file_hash(NOTIFIER) != file_hash(NOTIFIER_SRC):
-        shutil.copyfile(NOTIFIER_SRC, NOTIFIER)
-        changed = True
+    if file_hash(NOTIFIER) == file_hash(NOTIFIER_SRC):
+        return False
+    shutil.copyfile(NOTIFIER_SRC, NOTIFIER)
+    return True
 
+
+def wire_hooks(cdir: Path) -> bool:
+    """Add the notifier's two hooks to that account's settings.json. Returns True if it changed."""
+    settings_path = settings_file(cdir)
     py, script = Path(python_exe()).as_posix(), NOTIFIER.as_posix()
     wanted = {
         "UserPromptSubmit": {"type": "command", "command": f'"{py}" "{script}" start', "timeout": 15},
         "Stop": {"type": "command", "command": f'"{py}" "{script}" stop', "timeout": 20, "async": True},
     }
     try:
-        settings = json.loads(SETTINGS.read_text(encoding="utf-8")) if SETTINGS.is_file() else {}
+        settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.is_file() else {}
     except ValueError:
-        fail(f"{SETTINGS} is not valid JSON; fix it and re-run")
-        return changed
+        fail(f"{settings_path} is not valid JSON; fix it and re-run")
+        return False
     before = json.dumps(settings, sort_keys=True)
     hooks = settings.setdefault("hooks", {})
     for event, hook in wanted.items():
@@ -289,33 +349,79 @@ def install_notifier(quiet: bool = False) -> bool:
                 groups.append({**g, "hooks": kept})
         groups.append({"hooks": [hook]})
         hooks[event] = groups
-    if json.dumps(settings, sort_keys=True) != before:
-        SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-        if SETTINGS.is_file():
-            shutil.copyfile(SETTINGS, SETTINGS.with_name("settings.json.bak"))
-        SETTINGS.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        changed = True
+    if json.dumps(settings, sort_keys=True) == before:
+        return False
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    if settings_path.is_file():
+        shutil.copyfile(settings_path, settings_path.with_name("settings.json.bak"))
+    settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return True
 
-    CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    conf = json.loads(CONFIG.read_text(encoding="utf-8")) if CONFIG.is_file() else {
-        "timezone": "Asia/Ho_Chi_Minh",
-        "utc_offset_hours": 7,
-        "report_hour": 23,
-        "channels": {"activity": "dev-activity", "daily": "daily-report"},
-    }
-    before_conf = json.dumps(conf, sort_keys=True) if CONFIG.is_file() else ""
+
+def migrate_legacy(name: str) -> None:
+    """Move the single pre-profile setup (settings, report history, webhook) into profile `name`."""
+    state = STATE_ROOT / name
+    state.mkdir(parents=True, exist_ok=True)
+    moved = []
+    if (STATE_ROOT / "daily").is_dir() and not (state / "daily").exists():
+        shutil.move(str(STATE_ROOT / "daily"), str(state / "daily"))
+        moved.append("report history")
+    for f in STATE_ROOT.glob("pumble-*.json"):  # session snapshots and the channel ID cache
+        shutil.move(str(f), str(state / f.name))
+    if LEGACY_URL_FILE.is_file():
+        shutil.move(str(LEGACY_URL_FILE), str(PROFILES_DIR / f"{name}.webhook"))
+        moved.append("webhook")
+    LEGACY_CONFIG.replace(LEGACY_CONFIG.with_name("pumble.json.migrated"))
+    ok(f"moved {LEGACY_CONFIG.name}{''.join(', ' + m for m in moved)} into profile '{name}' "
+       f"(old file kept as {LEGACY_CONFIG.name}.migrated)")
+
+
+def setup_profile(cdir: Path) -> Path | None:
+    """Create or update the team-posts profile for this Claude account. Returns its file."""
+    path = profile_for(cdir)
+    migrate = False
+    if path:
+        conf = read_json(path)
+        before = json.dumps(conf, sort_keys=True)
+    else:
+        path = PROFILES_DIR / f"{profile_name(cdir)}.json"
+        if path.exists():
+            fail(f"{path} belongs to another Claude account ({tilde(profile_cdir(path))}); rename it and re-run")
+            return None
+        migrate = not profile_files() and LEGACY_CONFIG.is_file()
+        conf = {"claude_config_dir": tilde(cdir), **(read_json(LEGACY_CONFIG) if migrate else NEW_PROFILE)}
+        before = ""
     if str(WS) not in conf.setdefault("workspaces", []):
         conf["workspaces"] = [w for w in conf["workspaces"] if Path(os.path.expanduser(w)).resolve() != WS] + [str(WS)]
     if not conf.get("name"):
         conf["name"] = run(["git", "config", "--global", "user.name"]).stdout.strip()
     if not conf.get("name") and interactive():
         conf["name"] = input("  ? Your name in team posts (e.g. Tam): ").strip()
-    if json.dumps(conf, sort_keys=True) != before_conf:
-        CONFIG.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        changed = True
-    if not quiet:
-        ok(f"hooks in {SETTINGS}")
-        ok(f"settings in {CONFIG} (your name in posts: {conf.get('name') or 'not set, edit it'})")
+    if json.dumps(conf, sort_keys=True) != before:
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(conf, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    if migrate:
+        migrate_legacy(path.stem)
+    ok(f"profile '{path.stem}' in {path} (your name in posts: {conf.get('name') or 'not set, edit it'})")
+    return path
+
+
+def install_notifier(cdir: Path) -> None:
+    step("5. Team posts (Claude finished → #dev-activity, daily report → #daily-report)")
+    copy_notifier()
+    wire_hooks(cdir)
+    ok(f"hooks in {settings_file(cdir)}")
+    setup_profile(cdir)
+    if "pumble" not in mcp_servers(cdir):
+        warn(f"no Pumble keys for this account yet ({claude_json(cdir)}): nothing will post until they're added")
+
+
+def refresh_notifier() -> bool:
+    """`drivnx update`: new notifier copy and hooks for every account that has a profile."""
+    changed = copy_notifier()
+    accounts = {profile_cdir(p) for p in profile_files()} or {claude_dir()}
+    for cdir in sorted(accounts):
+        changed = wire_hooks(cdir) or changed
     return changed
 
 
@@ -375,7 +481,10 @@ def install_shim() -> None:
 # ---------------------------------------------------------------- commands
 
 def cmd_install(a: argparse.Namespace) -> int:
+    cdir = claude_dir()
     print(f"DrivnX workspace: {WS}")
+    print(f"Claude Code account: {tilde(cdir)}"
+          + ("" if os.environ.get("CLAUDE_CONFIG_DIR") else " (default; pass --claude-config DIR for another)"))
     if not check_tools(a.skip_deps):
         fail("git is required: install it and run `drivnx install` again")
         return 1
@@ -383,15 +492,17 @@ def cmd_install(a: argparse.Namespace) -> int:
     if not a.skip_deps:
         install_deps()
     plane_added = False if a.skip_mcp else setup_mcp()
-    install_notifier()
+    install_notifier(cdir)
     if not a.no_schedule:
         install_schedule()
     install_shim()
     cmd_status(argparse.Namespace(online=False))
-    steps = ["Restart Claude Code (it loads the hooks and MCP servers when it starts)."]
+    steps = ["Restart Claude Code (it loads the hooks and MCP servers when it starts)"
+             + ("." if cdir == DEFAULT_CLAUDE_DIR.resolve() else f", with CLAUDE_CONFIG_DIR={tilde(cdir)}.")]
     if plane_added or "plane" in mcp_servers():
         steps.append("Sign in to Plane once: in Claude Code type /mcp, pick plane, then Authenticate.")
-    steps.append(f"Work inside a code repo: cd {WS / 'drivnx-web'} && claude")
+    env = "" if cdir == DEFAULT_CLAUDE_DIR.resolve() else f"CLAUDE_CONFIG_DIR={tilde(cdir)} "
+    steps.append(f"Work inside a code repo: cd {WS / 'drivnx-web'} && {env}claude")
     print("\nLast steps:")
     for n, text in enumerate(steps, 1):
         print(f"  {n}. {text}")
@@ -419,29 +530,41 @@ def cmd_status(a: argparse.Namespace) -> int:
             v += " (logged in)" if gh_logged_in() else " (NOT logged in: gh auth login)"
         (ok if v else (fail if why == "required" else warn))(f"{name:<7} {v or 'not found'}  [{why}]")
 
-    step("Claude Code")
-    servers = mcp_servers()
+    cdir = claude_dir()
+    step(f"Claude Code  (account {tilde(cdir)})")
+    servers = mcp_servers(cdir)
     for name in ("plane", "pumble"):
         (ok if name in servers else fail)(f"MCP {name:<7} {'configured' if name in servers else 'missing (drivnx install)'}")
     if a.online and which("claude"):
         for line in run(["claude", "mcp", "list"]).stdout.splitlines():
             if line.split(":")[0].strip() in ("plane", "pumble"):
                 print(f"      {line.strip()}")
-    try:
-        cmds = json.dumps(json.loads(SETTINGS.read_text(encoding="utf-8")).get("hooks", {}))
-    except (OSError, ValueError):
-        cmds = ""
+    cmds = json.dumps(read_json(settings_file(cdir)).get("hooks", {}))
     hooks_ok = "pumble-notify.py\\\" start" in cmds and "pumble-notify.py\\\" stop" in cmds
     (ok if hooks_ok else fail)(f"hooks       {'start + stop' if hooks_ok else 'missing (drivnx install)'}")
     same = file_hash(NOTIFIER) == file_hash(NOTIFIER_SRC)
     (ok if same else warn)(f"notifier    {'up to date' if same else 'out of date (drivnx update)'}")
     sched = schedule_installed()
     (ok if sched else warn)(f"daily job   {'installed' if sched else 'not installed (drivnx install)'}")
-    if CONFIG.is_file():
-        c = json.loads(CONFIG.read_text(encoding="utf-8"))
-        ok(f"settings    name={c.get('name') or '?'}  timezone={c.get('timezone')}  report at {c.get('report_hour')}:00")
-    else:
-        fail("settings    missing (drivnx install)")
+    files = profile_files()
+    if not files:
+        if LEGACY_CONFIG.is_file():
+            c = read_json(LEGACY_CONFIG)
+            warn(f"settings    name={c.get('name') or '?'}  report at {c.get('report_hour')}:00  "
+                 "(single pumble.json: run drivnx install to make it a profile)")
+        else:
+            fail("settings    missing (drivnx install)")
+    elif not profile_for(cdir):
+        warn("profile     none for this account, so it posts nothing (drivnx install sets one up)")
+
+    if files:
+        step("Team-posts profiles  (one per Claude account, each with its own Pumble)")
+    for f in files:
+        c, pdir = read_json(f), profile_cdir(f)
+        keys = "pumble" in mcp_servers(pdir)
+        mark = "  ← this account" if pdir == cdir else ""
+        (ok if keys else fail)(f"{f.stem:<11} {tilde(pdir):<22} name={c.get('name') or '?'}  report at "
+                               f"{c.get('report_hour')}:00  {'Pumble keys found' if keys else 'NO Pumble keys'}{mark}")
 
     step("AI skills")
     for name in REPOS[1:]:
@@ -476,13 +599,20 @@ def cmd_update(a: argparse.Namespace) -> int:
         else:
             fail(f"{name} ({branch}): can't fast-forward (diverged); merge or rebase it yourself")
     step("Setup")
-    ok("team posts refreshed" if install_notifier(quiet=True) else "team posts already current")
+    ok("team posts refreshed" if refresh_notifier() else "team posts already current")
     return 0
 
 
 def cmd_report(a: argparse.Namespace) -> int:
     script = NOTIFIER if NOTIFIER.is_file() else NOTIFIER_SRC
-    args = [sys.executable, str(script), "digest", *([a.date] if a.date else [])]
+    mine = profile_for(claude_dir())
+    profile = a.profile or (mine.stem if mine else "")
+    if not profile and len(profile_files()) > 1:
+        fail("this Claude account has no team-posts profile; pick one with --profile "
+             + "|".join(f.stem for f in profile_files()))
+        return 1
+    args = [sys.executable, str(script), "digest", *([a.date] if a.date else []),
+            *(["--profile", profile] if profile else [])]
     if not a.post:
         args.append("--dry-run")
     r = subprocess.run(args)
@@ -506,19 +636,26 @@ def cmd_skills(a: argparse.Namespace) -> int:
 def main() -> int:
     p = argparse.ArgumentParser(prog="drivnx", description="Set up and look after the DrivnX workspace.")
     sub = p.add_subparsers(dest="cmd", required=True)
-    i = sub.add_parser("install", help="set up tools, repos, dependencies, Claude Code and the team posts")
+    account = argparse.ArgumentParser(add_help=False)
+    account.add_argument("--claude-config", metavar="DIR",
+                         help="the Claude Code account (config folder) to use; default $CLAUDE_CONFIG_DIR or ~/.claude")
+    i = sub.add_parser("install", parents=[account],
+                       help="set up tools, repos, dependencies, Claude Code and the team posts")
     i.add_argument("--skip-deps", action="store_true", help="don't install the code repos' dependencies")
     i.add_argument("--skip-mcp", action="store_true", help="don't add the Plane and Pumble MCP servers")
     i.add_argument("--no-schedule", action="store_true", help="don't install the hourly daily-report job")
-    s = sub.add_parser("status", help="health check")
+    s = sub.add_parser("status", parents=[account], help="health check")
     s.add_argument("--online", action="store_true", help="also ask Claude Code whether the MCP servers connect")
     sub.add_parser("update", help="pull every repo (fast-forward only) and refresh the setup")
-    r = sub.add_parser("report", help="preview a daily report, or post it with --post")
+    r = sub.add_parser("report", parents=[account], help="preview a daily report, or post it with --post")
     r.add_argument("date", nargs="?", help="YYYY-MM-DD (default: today)")
     r.add_argument("--post", action="store_true", help="post it to #daily-report")
+    r.add_argument("--profile", metavar="NAME", help="which team-posts profile (default: this account's)")
     k = sub.add_parser("skills", help="manage the shared AI skills")
     k.add_argument("action", choices=["sync"])
     a = p.parse_args()
+    if getattr(a, "claude_config", None):  # child processes (claude mcp add) use the same account
+        os.environ["CLAUDE_CONFIG_DIR"] = str(Path(os.path.expanduser(a.claude_config)).resolve())
     return {"install": cmd_install, "status": cmd_status, "update": cmd_update,
             "report": cmd_report, "skills": cmd_skills}[a.cmd](a)
 
