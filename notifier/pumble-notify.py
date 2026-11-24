@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -180,6 +181,12 @@ def web_url(repo: Path) -> str:
     remote = git(repo, "remote", "get-url", "origin").strip()
     m = re.fullmatch(r"(?:https?://|ssh://)?(?:[^@/]+@)?([^/:]+)[:/](.+?)(?:\.git)?/?", remote)
     return f"https://{m[1]}/{m[2]}" if m else ""
+
+
+def main_repo(repo: Path) -> Path:
+    """The main checkout of a git worktree (the repo itself if it isn't a worktree)."""
+    common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    return Path(common).parent if common.endswith(".git") else repo
 
 
 def new_commits(repo: Path, since_head: str) -> list[list[str]]:
@@ -361,7 +368,7 @@ def on_stop(payload: dict, cfg: dict) -> None:
     for r in changed:
         repo = Path(r)
         entries.append({
-            "repo": repo.name, "path": r,
+            "repo": repo.name, "path": r, "main": str(main_repo(repo)),
             "branch": git(repo, "branch", "--show-current").strip() or "detached",
             "commits": new_commits(repo, before[r].get("head", "")),
             "uncommitted": len(git(repo, "status", "--porcelain=v1", "-uall").splitlines()),
@@ -397,14 +404,30 @@ def daily_dir(cfg: dict) -> Path:
     return cfg["_state"] / "daily"
 
 
+def turn_repo(e: dict) -> Path:
+    """The repo a logged turn belongs to; a worktree counts as its main repo, so its commits aren't listed twice."""
+    if e.get("main"):
+        return Path(e["main"])
+    path = Path(e["path"])
+    return main_repo(path) if path.is_dir() else path
+
+
+def gh_exe() -> str | None:
+    """gh, also when cron runs us with a bare PATH (/usr/bin:/bin)."""
+    extra = [HOME / ".local" / "bin", Path("/usr/local/bin"), Path("/opt/homebrew/bin"),
+             Path("/home/linuxbrew/.linuxbrew/bin"), Path("/snap/bin")]
+    return shutil.which("gh") or shutil.which("gh", path=os.pathsep.join(map(str, extra)))
+
+
 def known_repos(cfg: dict, turns: list[dict]) -> list[Path]:
-    paths = {Path(e["path"]) for t in turns for e in t.get("repos", [])}
+    paths = {turn_repo(e) for t in turns for e in t.get("repos", [])}
     for ws in cfg.get("workspaces", []):
         paths.update(repos_under(Path(os.path.expanduser(ws))))
     return sorted(p for p in paths if p.is_dir())
 
 
 def build_report(day: date, cfg: dict) -> str:
+    """The day's report; commit and PR IDs link to GitHub (Pumble also lists those URLs at the end)."""
     start = datetime(day.year, day.month, day.day, tzinfo=local_tz(cfg))
     end = start + timedelta(days=1)
     f = daily_dir(cfg) / f"{day.isoformat()}.jsonl"
@@ -425,7 +448,10 @@ def build_report(day: date, cfg: dict) -> str:
         commits, url = unique, web_url(repo)
         prs = []
         try:
-            r = subprocess.run(["gh", "pr", "list", "--author", "@me", "--state", "all", "--limit", "30",
+            gh = gh_exe()
+            if not gh:
+                raise OSError("gh not found")
+            r = subprocess.run([gh, "pr", "list", "--author", "@me", "--state", "all", "--limit", "30",
                                 "--json", "number,title,state,createdAt,mergedAt,url"],
                                cwd=repo, capture_output=True, text=True, timeout=20)
             for pr in json.loads(r.stdout or "[]"):
@@ -438,13 +464,13 @@ def build_report(day: date, cfg: dict) -> str:
                         break
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
-        tasks = sum(1 for t in turns for e in t.get("repos", []) if e["path"] == str(repo))
+        tasks = sum(1 for t in turns for e in t.get("repos", []) if turn_repo(e) == repo)
         if not (commits or prs or tasks):
             continue
         lines = [f"**{repo.name}**"]
         if commits:
             lines.append(f"- Commits ({len(commits)}): " + ", ".join(
-                f"{f'[{short}]({url}/commit/{full})' if url else f'`{short}`'} {subject}"
+                f"{f'[`{short}`]({url}/commit/{full})' if url else f'`{short}`'} {subject}"
                 for full, short, subject in commits[:MAX_COMMITS])
                 + (f", … +{len(commits) - MAX_COMMITS}" if len(commits) > MAX_COMMITS else ""))
         if prs:
@@ -455,7 +481,7 @@ def build_report(day: date, cfg: dict) -> str:
     if not sections:
         return ""
 
-    out = [f"# {person(cfg).upper()}\n**📋 Daily report** · {day.strftime('%a %d %b %Y')}", *sections]
+    out = [f"**📋 Daily report** · {person(cfg)} · {day.strftime('%a %d %b %Y')}", *sections]
     skills = Counter(s for t in turns for s in t.get("skills", []))
     if skills:
         out.append("**Skills used:** " + ", ".join(f"{s} ×{n}" for s, n in skills.most_common()))
